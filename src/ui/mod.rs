@@ -25,7 +25,7 @@ pub fn build_window(app: &Application) {
     let saved_state = config::load();
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("vmlaunch")
+        .title(WINDOW_TITLE)
         .default_width(saved_state.width)
         .default_height(saved_state.height)
         .icon_name("vmlaunch")
@@ -87,7 +87,6 @@ pub fn build_window(app: &Application) {
     // --- Shared state ---
     let spice_state: Rc<RefCell<Option<spice::SharedState>>> = Rc::new(RefCell::new(None));
     let gpu_display: Rc<RefCell<Option<display::SpiceDisplay>>> = Rc::new(RefCell::new(None));
-    let is_fullscreen = Rc::new(Cell::new(saved_state.fullscreen));
     let shutdown_in_progress = Rc::new(Cell::new(false));
 
     // --- Keyboard input forwarding ---
@@ -150,6 +149,8 @@ pub fn build_window(app: &Application) {
         let spice_state_m = spice_state.clone();
         let gpu_m = gpu_display.clone();
         let pic_m = picture.clone();
+        // Carries the sub-click remainder between smooth-scroll events.
+        let scroll_accum = Cell::new(0.0f64);
         let legacy = EventControllerLegacy::new();
         legacy.connect_event(move |_, event| {
             let state_opt = spice_state_m.borrow();
@@ -227,9 +228,20 @@ pub fn build_window(app: &Application) {
                 }
                 gdk::EventType::Scroll => {
                     if let Some(se) = event.downcast_ref::<gdk::ScrollEvent>() {
-                        let (_, dy) = se.deltas();
-                        if dy.abs() > 0.01 {
-                            spice::mouse_scroll(state, dy < 0.0);
+                        let (_dx, dy) = se.deltas();
+                        // Wayland smooth scrolling delivers fractional deltas at
+                        // 60-120Hz plus a kinetic tail. Firing a wheel click per
+                        // event turned a gentle flick into dozens of them, so
+                        // accumulate and emit one click per whole unit.
+                        //
+                        // _dx is dropped deliberately: the SPICE protocol has no
+                        // horizontal wheel — buttons 6 and 7 are SIDE and EXTRA.
+                        let total = scroll_accum.get() + dy;
+                        let clicks = total.trunc();
+                        scroll_accum.set(total - clicks);
+                        #[allow(clippy::cast_possible_truncation)]
+                        for _ in 0..(clicks.abs() as i32) {
+                            spice::mouse_scroll(state, clicks < 0.0);
                         }
                     }
                     glib::Propagation::Stop
@@ -243,16 +255,15 @@ pub fn build_window(app: &Application) {
     // --- Fullscreen toolbar hover detection ---
     {
         let revealer = tb.revealer.clone();
-        let is_fs = is_fullscreen.clone();
         let hide_timer: Rc<RefCell<Option<(glib::SourceId, Rc<Cell<bool>>)>>> =
             Rc::new(RefCell::new(None));
 
         let motion_ctrl = EventControllerMotion::new();
         let rev = revealer.clone();
         let ht = hide_timer.clone();
-        let is_fs2 = is_fs.clone();
+        let win_fs = window.clone();
         motion_ctrl.connect_motion(move |_, _x, y| {
-            if !is_fs2.get() {
+            if !win_fs.is_fullscreen() {
                 return;
             }
             if y <= 2.0 {
@@ -294,20 +305,14 @@ pub fn build_window(app: &Application) {
     // --- F11 fullscreen toggle ---
     {
         let win = window.clone();
-        let is_fs = is_fullscreen.clone();
-        let revealer = tb.revealer.clone();
         let key_ctrl = EventControllerKey::new();
         key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
             if keyval == gdk::Key::F11 {
-                if is_fs.get() {
+                if win.is_fullscreen() {
                     win.unfullscreen();
-                    is_fs.set(false);
-                    revealer.set_reveal_child(false);
                 } else {
                     win.fullscreen();
-                    is_fs.set(true);
                 }
-                save_window_state(&win, is_fs.get());
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -315,16 +320,26 @@ pub fn build_window(app: &Application) {
         window.add_controller(key_ctrl);
     }
 
+    // --- Fullscreen state is owned by the window, not tracked by hand ---
+    // Using the property means GNOME's own Super+Up stays in sync, and it fires
+    // after the state has actually changed rather than while the (async on
+    // Wayland) transition is still in flight.
+    {
+        let revealer = tb.revealer.clone();
+        window.connect_fullscreened_notify(move |win| {
+            let fullscreen = win.is_fullscreen();
+            if !fullscreen {
+                revealer.set_reveal_child(false);
+            }
+            save_fullscreen_flag(fullscreen);
+        });
+    }
+
     // --- Toolbar button handlers ---
     {
         let win = window.clone();
-        let is_fs = is_fullscreen.clone();
-        let revealer = tb.revealer.clone();
         tb.exit_fullscreen_btn.connect_clicked(move |_| {
             win.unfullscreen();
-            is_fs.set(false);
-            revealer.set_reveal_child(false);
-            save_window_state(&win, false);
         });
     }
     {
@@ -347,12 +362,14 @@ pub fn build_window(app: &Application) {
     {
         let spice_state = spice_state.clone();
         let shutdown_in_progress = shutdown_in_progress.clone();
-        let stack = stack.clone();
-        let status_label = status_label.clone();
         window.connect_close_request(move |win| {
             if shutdown_in_progress.get() {
                 return glib::Propagation::Stop;
             }
+
+            // Capture geometry here, while it is still real. Every later point
+            // is either behind a modal dialog or mid-teardown.
+            save_window_state(win);
 
             // Show confirmation dialog
             let dialog = AlertDialog::builder()
@@ -367,50 +384,63 @@ pub fn build_window(app: &Application) {
             let win = win.clone();
             let spice_state = spice_state.clone();
             let shutdown_in_progress = shutdown_in_progress.clone();
-            let stack = stack.clone();
-            let status_label = status_label.clone();
 
             dialog.choose(Some(&win_for_dialog), None::<&gtk4::gio::Cancellable>, move |result| {
                 match result {
                     Ok(0) => {
-                        // Shut Down
+                        // Shut Down. Ask the VM to power off but stay connected
+                        // while it does — the guest's own "these apps are
+                        // preventing shutdown" dialog is usually the reason this
+                        // takes a while, and it has to be visible to be dismissed.
                         shutdown_in_progress.set(true);
-                        {
-                            let state_opt = spice_state.borrow();
-                            if let Some(ref state) = *state_opt {
-                                spice::disconnect(state);
-                            }
-                        }
-                        status_label.set_text("Shutting down VM...");
-                        stack.set_visible_child_name("loading");
-
                         if let Err(e) = vm::shutdown() {
                             log::error!("shutdown failed: {e}");
                         }
 
                         let win = win.clone();
+                        let spice_state = spice_state.clone();
                         let tick = Rc::new(Cell::new(0u32));
-                        let status = status_label.clone();
+                        let prompting = Rc::new(Cell::new(false));
+                        let finished = Rc::new(Cell::new(false));
+
                         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+                            if finished.get() {
+                                return glib::ControlFlow::Break;
+                            }
+                            if prompting.get() {
+                                return glib::ControlFlow::Continue;
+                            }
+
                             let count = tick.get() + 1;
                             tick.set(count);
-                            status.set_text(&format!("Shutting down VM... ({count}s)"));
+                            win.set_title(Some(&format!(
+                                "{WINDOW_TITLE} — shutting down ({count}s)"
+                            )));
+
                             match vm::state() {
                                 Ok(vm::VmState::Shutoff) => {
                                     log::info!("VM shut off cleanly");
-                                    win.destroy();
+                                    finish_shutdown(&spice_state, &win, &finished);
                                     glib::ControlFlow::Break
                                 }
-                                Ok(_) if count >= 60 => {
-                                    log::warn!("shutdown timeout — forcing off");
-                                    let _ = vm::force_off();
-                                    win.destroy();
-                                    glib::ControlFlow::Break
+                                Ok(_) if count >= SHUTDOWN_PROMPT_SECS => {
+                                    // Never pull the power behind the user's
+                                    // back — ask, and keep waiting by default.
+                                    prompting.set(true);
+                                    prompt_force_off(
+                                        &win,
+                                        &spice_state,
+                                        &tick,
+                                        &prompting,
+                                        &finished,
+                                    );
+                                    glib::ControlFlow::Continue
                                 }
                                 Err(e) => {
+                                    // A transient virsh failure (libvirtd
+                                    // restarting) must not tear the window down.
                                     log::error!("state check error: {e}");
-                                    win.destroy();
-                                    glib::ControlFlow::Break
+                                    glib::ControlFlow::Continue
                                 }
                                 _ => glib::ControlFlow::Continue,
                             }
@@ -425,7 +455,6 @@ pub fn build_window(app: &Application) {
                                 spice::disconnect(state);
                             }
                         }
-                        save_window_state(&win, false);
                         win.destroy();
                     }
                     Ok(2) => {
@@ -570,6 +599,13 @@ pub fn build_window(app: &Application) {
 /// guest — roughly 300ms at 60Hz, so a drag-resize doesn't spam the agent.
 const RESIZE_SETTLE_TICKS: u32 = 18;
 
+/// How long to wait for an ACPI shutdown before offering to force the VM off.
+const SHUTDOWN_PROMPT_SECS: u32 = 60;
+
+/// Window title. Matches `Name=` in the desktop entry so the dock, the window
+/// list and Alt+Tab all agree on one name.
+const WINDOW_TITLE: &str = "Windows 11";
+
 /// Debounces window-size changes before asking the guest to switch resolution.
 ///
 /// Driven from the render tick rather than a size-allocate signal: GTK4 exposes
@@ -636,11 +672,83 @@ fn widget_to_vm(
 }
 
 /// Save current window state to config file.
-fn save_window_state(window: &ApplicationWindow, fullscreen: bool) {
-    config::save(&config::WindowState {
-        width: window.width(),
-        height: window.height(),
-        fullscreen,
+///
+/// In fullscreen the allocation is the whole monitor rather than the size the
+/// user chose, so the stored dimensions are left alone and only the flag moves.
+fn save_window_state(window: &ApplicationWindow) {
+    let fullscreen = window.is_fullscreen();
+    let (width, height) = if fullscreen {
+        let previous = config::load();
+        (previous.width, previous.height)
+    } else {
+        (window.width(), window.height())
+    };
+    config::save(&config::WindowState { width, height, fullscreen });
+}
+
+/// Record only the fullscreen flag, preserving the stored window dimensions.
+fn save_fullscreen_flag(fullscreen: bool) {
+    let mut state = config::load();
+    state.fullscreen = fullscreen;
+    config::save(&state);
+}
+
+/// Tear down the SPICE session and close the window. Idempotent, because both
+/// the poll loop and the force-off dialog can reach it.
+fn finish_shutdown(
+    spice_state: &Rc<RefCell<Option<spice::SharedState>>>,
+    window: &ApplicationWindow,
+    finished: &Rc<Cell<bool>>,
+) {
+    if finished.replace(true) {
+        return;
+    }
+    if let Some(ref state) = *spice_state.borrow() {
+        spice::disconnect(state);
+    }
+    window.destroy();
+}
+
+/// Ask whether to keep waiting for a slow shutdown or force the VM off.
+///
+/// Replaces an unconditional `virsh destroy` that fired after 60 seconds with
+/// only a log line to show for it.
+fn prompt_force_off(
+    window: &ApplicationWindow,
+    spice_state: &Rc<RefCell<Option<spice::SharedState>>>,
+    tick: &Rc<Cell<u32>>,
+    prompting: &Rc<Cell<bool>>,
+    finished: &Rc<Cell<bool>>,
+) {
+    let dialog = AlertDialog::builder()
+        .message("The VM is still shutting down")
+        .detail(
+            "Windows has not powered off yet — it may be waiting on an app or an update.\n\n\
+             Forcing it off is equivalent to pulling the power cable and can lose unsaved work.",
+        )
+        .build();
+    dialog.set_buttons(&["Keep Waiting", "Force Off"]);
+    dialog.set_cancel_button(0);
+    dialog.set_default_button(0);
+
+    let win = window.clone();
+    let spice_state = spice_state.clone();
+    let tick = tick.clone();
+    let prompting = prompting.clone();
+    let finished = finished.clone();
+    dialog.choose(Some(window), None::<&gtk4::gio::Cancellable>, move |result| {
+        if matches!(result, Ok(1)) {
+            log::warn!("user chose to force the VM off");
+            if let Err(e) = vm::force_off() {
+                log::error!("force off failed: {e}");
+            }
+            finish_shutdown(&spice_state, &win, &finished);
+        } else {
+            // Keep waiting — restart the countdown so we ask again later
+            // rather than never asking again.
+            tick.set(0);
+            prompting.set(false);
+        }
     });
 }
 

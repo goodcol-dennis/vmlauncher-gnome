@@ -12,6 +12,8 @@ pub enum VmState {
     Running,
     Shutoff,
     Paused,
+    /// Guest-initiated suspend-to-RAM. Needs a wakeup, not a start.
+    Pmsuspended,
     Other,
 }
 
@@ -25,8 +27,19 @@ fn parse_state(raw: &str) -> VmState {
         "running" => VmState::Running,
         "shut off" => VmState::Shutoff,
         "paused" => VmState::Paused,
+        "pmsuspended" => VmState::Pmsuspended,
         _ => VmState::Other,
     }
+}
+
+/// Run a `virsh` subcommand against the VM, failing with its stderr.
+fn virsh(subcommand: &str) -> anyhow::Result<()> {
+    let output = Command::new("virsh").args([subcommand, VM_NAME]).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("virsh {subcommand} failed: {}", stderr.trim());
+    }
+    Ok(())
 }
 
 /// Query current VM state.
@@ -37,41 +50,43 @@ pub fn state() -> anyhow::Result<VmState> {
     Ok(parse_state(&stdout))
 }
 
-/// Start the VM. No-op if already running.
+/// Bring the VM up, whatever state it is currently in.
+///
+/// A domain that was paused or suspended needs resuming or waking rather than
+/// starting — `virsh start` on either just fails with "Domain is already
+/// active", which is exactly the state you land in after detaching and letting
+/// Windows go to sleep.
 pub fn start() -> anyhow::Result<()> {
-    if state()? == VmState::Running {
-        log::info!("VM {VM_NAME} already running");
-        return Ok(());
+    match state()? {
+        VmState::Running => {
+            log::info!("VM {VM_NAME} already running");
+            Ok(())
+        }
+        VmState::Paused => {
+            log::info!("VM {VM_NAME} is paused — resuming");
+            virsh("resume")
+        }
+        VmState::Pmsuspended => {
+            log::info!("VM {VM_NAME} is suspended — waking");
+            virsh("dompmwakeup")
+        }
+        VmState::Shutoff | VmState::Other => {
+            log::info!("starting VM: {VM_NAME}");
+            virsh("start")
+        }
     }
-    log::info!("starting VM: {VM_NAME}");
-    let output = Command::new("virsh").args(["start", VM_NAME]).output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("virsh start failed: {stderr}");
-    }
-    Ok(())
 }
 
 /// Send ACPI shutdown to the VM.
 pub fn shutdown() -> anyhow::Result<()> {
     log::info!("sending ACPI shutdown to VM: {VM_NAME}");
-    let output = Command::new("virsh").args(["shutdown", VM_NAME]).output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("virsh shutdown failed: {stderr}");
-    }
-    Ok(())
+    virsh("shutdown")
 }
 
 /// Force-off the VM (destroy).
 pub fn force_off() -> anyhow::Result<()> {
     log::warn!("force-off VM: {VM_NAME}");
-    let output = Command::new("virsh").args(["destroy", VM_NAME]).output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("virsh destroy failed: {stderr}");
-    }
-    Ok(())
+    virsh("destroy")
 }
 
 /// Parse `virsh domdisplay` output into a display URI.
@@ -102,6 +117,7 @@ mod tests {
         assert_eq!(parse_state("running"), VmState::Running);
         assert_eq!(parse_state("shut off"), VmState::Shutoff);
         assert_eq!(parse_state("paused"), VmState::Paused);
+        assert_eq!(parse_state("pmsuspended"), VmState::Pmsuspended);
     }
 
     /// `virsh` terminates its output with a newline and a blank line; parsing
@@ -118,7 +134,7 @@ mod tests {
     /// concluding the VM is off.
     #[test]
     fn unmodelled_states_become_other() {
-        for raw in ["in shutdown", "pmsuspended", "crashed", "idle", "no state"] {
+        for raw in ["in shutdown", "crashed", "idle", "no state"] {
             assert_eq!(parse_state(raw), VmState::Other, "{raw}");
         }
     }

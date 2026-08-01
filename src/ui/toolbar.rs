@@ -37,6 +37,13 @@ pub fn build() -> Toolbar {
     close_btn.add_css_class("destructive-action");
     hbox.append(&close_btn);
 
+    // Keep keyboard focus on the display. Otherwise clicking Ctrl+Alt+Del hands
+    // focus to the button, and the password you type next goes to the toolbar —
+    // with Enter re-triggering Ctrl+Alt+Del.
+    for button in [&ctrl_alt_del_btn, &exit_fullscreen_btn, &close_btn] {
+        button.set_focus_on_click(false);
+    }
+
     let revealer = Revealer::new();
     revealer.set_transition_type(RevealerTransitionType::SlideDown);
     revealer.set_transition_duration(200);
