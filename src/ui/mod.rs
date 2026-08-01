@@ -81,8 +81,9 @@ pub fn build_window(app: &Application) {
     overlay.add_overlay(&tb.revealer);
 
     window.set_child(Some(&overlay));
-    // TODO: Hide host cursor once coordinate alignment is fixed
-    // picture.set_cursor_from_name(Some("none"));
+    // The host cursor is hidden by CursorPolicy once the guest negotiates
+    // client mouse mode — not here, because before that the guest isn't
+    // tracking our coordinates and hiding it would leave no pointer at all.
 
     // --- Shared state ---
     let spice_state: Rc<RefCell<Option<spice::SharedState>>> = Rc::new(RefCell::new(None));
@@ -509,6 +510,7 @@ pub fn build_window(app: &Application) {
                         let gpu_render = gpu_display.clone();
                         let spice_for_render = spice_state.clone();
                         let resize = ResizeTracker::default();
+                        let cursor = CursorPolicy::default();
 
                         // Frame-synced rendering. A tick callback runs only while
                         // the widget is mapped and goes away with it — unlike the
@@ -527,6 +529,7 @@ pub fn build_window(app: &Application) {
                                 }
                             }
                             resize.poll(pic, ss);
+                            cursor.poll(pic, ss);
                             glib::ControlFlow::Continue
                         });
 
@@ -605,6 +608,52 @@ const SHUTDOWN_PROMPT_SECS: u32 = 60;
 /// Window title. Matches `Name=` in the desktop entry so the dock, the window
 /// list and Alt+Tab all agree on one name.
 const WINDOW_TITLE: &str = "Windows 11";
+
+/// How often the tick callback re-reads the guest's mouse mode. It changes at
+/// most once per boot, so once every half second is generous.
+const MOUSE_MODE_POLL_TICKS: u32 = 30;
+
+/// Decides whether the host cursor should be drawn over the display.
+///
+/// The guest's virtio-gpu DOD driver exposes no hardware cursor plane, so
+/// Windows composites its pointer directly into the framebuffer. Drawing the
+/// host cursor on top of that gives two arrows that can never quite agree: the
+/// guest's is a round trip behind, and is scaled by whatever the
+/// framebuffer-to-widget ratio happens to be.
+///
+/// Hiding it is only safe in client (absolute) mouse mode. In server mode —
+/// UEFI, recovery, the first seconds of boot — the guest is not tracking the
+/// coordinates we send, so hiding the host cursor would leave no usable
+/// pointer at all.
+#[derive(Default)]
+struct CursorPolicy {
+    hidden: Cell<Option<bool>>,
+    ticks: Cell<u32>,
+}
+
+impl CursorPolicy {
+    fn poll(&self, pic: &Picture, state: &spice::SharedState) {
+        let ticks = self.ticks.get().wrapping_add(1);
+        self.ticks.set(ticks);
+        if ticks > 1 && !ticks.is_multiple_of(MOUSE_MODE_POLL_TICKS) {
+            return;
+        }
+
+        let should_hide = spice::mouse_mode(state) == spice::MOUSE_MODE_CLIENT;
+        if self.hidden.get() == Some(should_hide) {
+            return;
+        }
+        self.hidden.set(Some(should_hide));
+
+        if should_hide {
+            pic.set_cursor_from_name(Some("none"));
+            log::info!("client mouse mode — hiding host cursor, guest draws its own");
+        } else {
+            pic.set_cursor(None);
+            log::info!("server mouse mode — restoring host cursor");
+        }
+    }
+}
 
 /// Debounces window-size changes before asking the guest to switch resolution.
 ///

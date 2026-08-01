@@ -148,6 +148,35 @@ pub fn disconnect(state: &SharedState) {
     s.framebuffer = None;
 }
 
+/// Server-side (relative) pointer. The guest draws no cursor of its own at a
+/// position we control, so the host cursor must stay visible.
+pub const MOUSE_MODE_SERVER: i32 = 1 << 0;
+/// Client-side (absolute) pointer, negotiated once the SPICE agent is up.
+pub const MOUSE_MODE_CLIENT: i32 = 1 << 1;
+
+/// Current pointer mode, or [`MOUSE_MODE_SERVER`] if the main channel isn't up.
+///
+/// The guest only tracks our absolute coordinates in client mode. Before the
+/// agent connects — UEFI menu, recovery, the first seconds of boot — it is in
+/// server mode and its cursor is wherever *it* thinks it is, not where we said.
+pub fn mouse_mode(state: &SharedState) -> i32 {
+    let s = state.borrow();
+    if s.main_channel.is_null() {
+        return MOUSE_MODE_SERVER;
+    }
+    let mut mode: std::os::raw::c_int = MOUSE_MODE_SERVER;
+    let prop = CString::new("mouse-mode").unwrap();
+    unsafe {
+        ffi::g_object_get(
+            s.main_channel,
+            prop.as_ptr(),
+            &raw mut mode,
+            ptr::null::<std::os::raw::c_void>(),
+        );
+    }
+    mode
+}
+
 /// Ask the guest to switch its display to `width` x `height` physical pixels.
 ///
 /// Requires the SPICE agent and a resizable display driver in the guest; where
