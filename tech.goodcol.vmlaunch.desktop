@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Windows 11
+GenericName=Virtual Machine
+Comment=Launch Windows 11 KVM/SPICE VM
+Exec=vmlaunch
+Icon=vmlaunch
+Terminal=false
+StartupWMClass=tech.goodcol.vmlaunch
+Categories=System;Emulator;
+Keywords=vm;windows;kvm;spice;

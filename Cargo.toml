@@ -1,0 +1,22 @@
+[package]
+name = "vmlaunch"
+version = "0.1.0"
+edition = "2024"
+description = "Single-click GTK4 app to launch and display a KVM/SPICE Windows VM"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_14"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+module_name_repetitions = "allow"
+type_complexity = "allow"

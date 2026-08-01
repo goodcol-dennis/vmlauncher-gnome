@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la ~/.local/share/applications/*vmlaunch*)",
+      "Bash(ls -la ~/.local/share/applications/*goodcol*)",
+      "Bash(gtk4-icon-browser --help)",
+      "Bash(python3 -c ':*)",
+      "Bash(xdg-desktop-menu forceupdate:*)",
+      "Bash(desktop-file-validate ~/.local/share/applications/tech.goodcol.vmlaunch.desktop)",
+      "Bash(grep -r \"EventControllerLegacy\\\\|event_controller_legacy\" /home/dennis/.cargo/registry/src/*/gtk4-0.9.*/src/)",
+      "WebFetch(domain:gitlab.freedesktop.org)",
+      "Bash(apt source:*)",
+      "Bash(dpkg -L libspice-client-gtk-3.0-5)",
+      "Bash(find /usr/share/doc/libspice* -name \"*.gz\")",
+      "Bash(ls /tmp/spice-gtk*.tar.*)",
+      "Bash(gh search:*)",
+      "Bash(nm -D /usr/lib/x86_64-linux-gnu/libspice-client-gtk-3.0.so.5)",
+      "Bash(RUST_LOG=trace timeout 10 ~/.local/bin/vmlaunch)",
+      "Bash(RUST_LOG=trace timeout 12 ~/.local/bin/vmlaunch)"
+    ]
+  }
+}
