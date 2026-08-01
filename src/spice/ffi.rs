@@ -79,6 +79,12 @@ unsafe extern "C" {
     // --- SpiceChannel ---
     pub fn spice_channel_connect(channel: *mut SpiceChannel) -> gboolean;
 
+    // --- SpiceAudio ---
+    // Binds a GStreamer sink to the session's playback/record channels. Without
+    // it those channels still open but their samples go nowhere.
+    // Returns (transfer none) — owned by the session, must NOT be unreffed.
+    pub fn spice_audio_get(session: *mut SpiceSession, context: gpointer) -> gpointer;
+
     // --- SpiceMainChannel ---
     pub fn spice_main_channel_update_display(
         channel: gpointer, // SpiceMainChannel*

@@ -11,8 +11,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     AlertDialog, Align, Application, ApplicationWindow, Box as GtkBox, ContentFit,
-    EventControllerKey, EventControllerLegacy, EventControllerMotion, Label, Orientation, Overlay,
-    Picture, Spinner, Stack,
+    EventControllerFocus, EventControllerKey, EventControllerLegacy, EventControllerMotion, Label,
+    Orientation, Overlay, Picture, Spinner, Stack,
 };
 
 use crate::config;
@@ -57,7 +57,7 @@ pub fn build_window(app: &Application) {
     loading_box.append(&spinner);
     loading_box.append(&status_label);
 
-    // --- SPICE display (Picture — GPU-accelerated via GLTexture) ---
+    // --- SPICE display (Picture fed by a MemoryTexture, not GL — see display.rs) ---
     let picture = Picture::new();
     picture.set_hexpand(true);
     picture.set_vexpand(true);
@@ -86,7 +86,7 @@ pub fn build_window(app: &Application) {
 
     // --- Shared state ---
     let spice_state: Rc<RefCell<Option<spice::SharedState>>> = Rc::new(RefCell::new(None));
-    let gpu_display: Rc<RefCell<Option<display::GpuDisplay>>> = Rc::new(RefCell::new(None));
+    let gpu_display: Rc<RefCell<Option<display::SpiceDisplay>>> = Rc::new(RefCell::new(None));
     let is_fullscreen = Rc::new(Cell::new(saved_state.fullscreen));
     let shutdown_in_progress = Rc::new(Cell::new(false));
 
@@ -101,10 +101,10 @@ pub fn build_window(app: &Application) {
                 return glib::Propagation::Proceed;
             }
             let state_opt = ss2.borrow();
-            if let Some(ref state) = *state_opt {
-                spice::key_press(state, keycode);
-            }
-            glib::Propagation::Stop
+            let sent = state_opt.as_ref().is_some_and(|s| spice::key_press(s, keycode));
+            // A key with no XT scancode (media keys, unmapped extras) falls
+            // through to the host rather than being swallowed by the VM.
+            if sent { glib::Propagation::Stop } else { glib::Propagation::Proceed }
         });
 
         let ss3 = ss.clone();
@@ -119,6 +119,28 @@ pub fn build_window(app: &Application) {
         });
 
         picture.add_controller(key_ctrl);
+
+        // The compositor eats the key-up for whatever chord stole focus, so the
+        // guest never sees those keys rise. Release them ourselves.
+        let ss4 = ss.clone();
+        let focus_ctrl = EventControllerFocus::new();
+        focus_ctrl.connect_leave(move |_| {
+            if let Some(ref state) = *ss4.borrow() {
+                spice::release_all_keys(state);
+            }
+        });
+        picture.add_controller(focus_ctrl);
+
+        // Widget focus can stay put while the whole window goes inactive
+        // (Super, workspace switch), so cover that separately.
+        let ss5 = ss.clone();
+        window.connect_is_active_notify(move |win| {
+            if !win.is_active()
+                && let Some(ref state) = *ss5.borrow()
+            {
+                spice::release_all_keys(state);
+            }
+        });
     }
 
     // --- Mouse input forwarding (all events via EventControllerLegacy) ---
@@ -457,14 +479,25 @@ pub fn build_window(app: &Application) {
                         let gpu_inval = gpu_display.clone();
                         let gpu_render = gpu_display.clone();
                         let spice_for_render = spice_state.clone();
+                        let resize = ResizeTracker::default();
 
-                        // 60fps render timer — reads SPICE framebuffer directly
-                        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                            let disp = gpu_render.borrow();
+                        // Frame-synced rendering. A tick callback runs only while
+                        // the widget is mapped and goes away with it — unlike the
+                        // bare 16ms timeout this replaces, which was never stopped
+                        // on disconnect and kept copying a whole framebuffer per
+                        // frame behind a minimized window.
+                        pic_render.add_tick_callback(move |pic, _clock| {
                             let spice_opt = spice_for_render.borrow();
-                            if let (Some(d), Some(ss)) = (&*disp, &*spice_opt) {
-                                d.render_if_dirty(&pic_render, ss);
+                            let Some(ss) = &*spice_opt else {
+                                return glib::ControlFlow::Continue;
+                            };
+                            {
+                                let disp = gpu_render.borrow();
+                                if let Some(d) = &*disp {
+                                    d.render_if_dirty(pic, ss);
+                                }
                             }
+                            resize.poll(pic, ss);
                             glib::ControlFlow::Continue
                         });
 
@@ -473,13 +506,11 @@ pub fn build_window(app: &Application) {
                             // on_display_ready
                             move |w, h| {
                                 log::info!("display ready {w}x{h}");
-                                let stride = w * 4;
-
                                 let mut disp = gpu_ready.borrow_mut();
                                 if let Some(ref mut existing) = *disp {
-                                    existing.resize(w, h, stride);
+                                    existing.resize(w, h);
                                 } else {
-                                    *disp = Some(display::GpuDisplay::new(w, h, stride));
+                                    *disp = Some(display::SpiceDisplay::new(w, h));
                                 }
 
                                 stack2.set_visible_child_name("display");
@@ -500,16 +531,13 @@ pub fn build_window(app: &Application) {
                                 glib::timeout_add_local(
                                     std::time::Duration::from_secs(2),
                                     move || {
-                                        let s = ss_clip.borrow();
-                                        if !s.main_channel.is_null() {
-                                            drop(s);
-                                            spice::clipboard::setup(
-                                                ss_clip.borrow().main_channel,
-                                                &display,
-                                            );
-                                            return glib::ControlFlow::Break;
+                                        let channel = ss_clip.borrow().main_channel;
+                                        if channel.is_null() {
+                                            return glib::ControlFlow::Continue;
                                         }
-                                        glib::ControlFlow::Continue
+                                        let handle = spice::clipboard::setup(channel, &display);
+                                        ss_clip.borrow_mut().clipboard = Some(handle);
+                                        glib::ControlFlow::Break
                                     },
                                 );
                                 spice_state.borrow_mut().replace(state);
@@ -536,6 +564,48 @@ pub fn build_window(app: &Application) {
     }
 
     window_for_present.present();
+}
+
+/// Number of consecutive stable frames before a new window size is pushed to the
+/// guest — roughly 300ms at 60Hz, so a drag-resize doesn't spam the agent.
+const RESIZE_SETTLE_TICKS: u32 = 18;
+
+/// Debounces window-size changes before asking the guest to switch resolution.
+///
+/// Driven from the render tick rather than a size-allocate signal: GTK4 exposes
+/// allocation as a vfunc rather than a signal, and we already have a per-frame
+/// callback on the Picture.
+#[derive(Default)]
+struct ResizeTracker {
+    /// Most recent size observed, in physical pixels.
+    seen: Cell<(i32, i32)>,
+    /// How many consecutive frames `seen` has held steady.
+    stable_ticks: Cell<u32>,
+    /// Last size actually sent to the guest, so we send each one once.
+    applied: Cell<(i32, i32)>,
+}
+
+impl ResizeTracker {
+    fn poll(&self, pic: &Picture, state: &spice::SharedState) {
+        let scale = pic.scale_factor();
+        let size = (pic.width() * scale, pic.height() * scale);
+        if size.0 <= 0 || size.1 <= 0 {
+            return;
+        }
+        if size != self.seen.get() {
+            self.seen.set(size);
+            self.stable_ticks.set(0);
+            return;
+        }
+        // Saturating, so once it pins at u32::MAX it can never re-trigger.
+        let ticks = self.stable_ticks.get().saturating_add(1);
+        self.stable_ticks.set(ticks);
+        if ticks != RESIZE_SETTLE_TICKS || size == self.applied.get() {
+            return;
+        }
+        self.applied.set(size);
+        spice::set_display_size(state, size.0, size.1);
+    }
 }
 
 /// Map widget-local coordinates to VM display coordinates.

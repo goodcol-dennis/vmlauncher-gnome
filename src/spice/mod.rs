@@ -5,13 +5,29 @@ pub mod ffi;
 pub mod keymap;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::ptr;
 use std::rc::Rc;
 
 /// Framebuffer data received from the SPICE display channel.
+///
+/// `data` is borrowed from spice-gtk, which frees it on `display-primary-destroy`.
+/// The geometry travels with the pointer so a reader can size its slice from what
+/// SPICE actually reported rather than re-deriving it, which would over-read if
+/// the two ever disagreed.
 pub struct Framebuffer {
     pub data: *const u8,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+}
+
+impl Framebuffer {
+    /// Total length of the pixel buffer in bytes.
+    pub fn byte_len(&self) -> usize {
+        (self.stride as usize).saturating_mul(self.height as usize)
+    }
 }
 
 /// Shared state for the SPICE client, accessible from `GLib` signal callbacks.
@@ -21,10 +37,16 @@ pub struct SpiceState {
     pub inputs_channel: *mut ffi::SpiceInputsChannel,
     pub framebuffer: Option<Framebuffer>,
     pub mouse_button_state: u32,
+    /// XT scancodes currently held down, so they can be released if the window
+    /// loses focus mid-keypress. GTK4 does not synthesize releases on focus-out,
+    /// so without this an Alt+Tab away leaves Alt stuck down inside the guest.
+    pub held_keys: HashSet<u32>,
     /// Called when the display framebuffer is first created or resized.
     pub on_display_ready: Option<Box<dyn Fn(i32, i32)>>,
     /// Called when a region of the display is invalidated (needs redraw).
     pub on_invalidate: Option<Box<dyn Fn(i32, i32, i32, i32)>>,
+    /// Host-clipboard subscription, torn down with the session.
+    pub clipboard: Option<clipboard::Handle>,
 }
 
 pub type SharedState = Rc<RefCell<SpiceState>>;
@@ -42,8 +64,10 @@ pub fn connect(
         inputs_channel: ptr::null_mut(),
         framebuffer: None,
         mouse_button_state: 0,
+        held_keys: HashSet::new(),
         on_display_ready: Some(Box::new(on_ready)),
         on_invalidate: Some(Box::new(on_invalidate)),
+        clipboard: None,
     }));
 
     unsafe {
@@ -78,6 +102,15 @@ pub fn connect(
             state_ptr,
         );
 
+        // Bind an audio sink before connecting, so the playback and record
+        // channels have somewhere to go the moment they open. The returned
+        // object is owned by the session — do not unref it.
+        if ffi::spice_audio_get(session, ptr::null_mut()).is_null() {
+            log::warn!("SPICE audio unavailable — the VM will be silent");
+        } else {
+            log::info!("SPICE audio enabled");
+        }
+
         // Start the connection
         let ok = ffi::spice_session_connect(session);
         if ok == 0 {
@@ -96,6 +129,13 @@ pub fn connect(
 /// Disconnect the SPICE session and clean up.
 pub fn disconnect(state: &SharedState) {
     let mut s = state.borrow_mut();
+    // Detach from the app-global host clipboard first: it outlives the session,
+    // and its handler holds a pointer to the channel we are about to finalize.
+    if let Some(ref mut handle) = s.clipboard {
+        handle.teardown();
+    }
+    s.clipboard = None;
+    s.held_keys.clear();
     if !s.session.is_null() {
         unsafe {
             ffi::spice_session_disconnect(s.session);
@@ -106,6 +146,21 @@ pub fn disconnect(state: &SharedState) {
     }
     s.inputs_channel = ptr::null_mut();
     s.framebuffer = None;
+}
+
+/// Ask the guest to switch its display to `width` x `height` physical pixels.
+///
+/// Requires the SPICE agent and a resizable display driver in the guest; where
+/// either is missing this is silently ignored, which is the desired fallback.
+pub fn set_display_size(state: &SharedState, width: i32, height: i32) {
+    let s = state.borrow();
+    if s.main_channel.is_null() || width <= 0 || height <= 0 {
+        return;
+    }
+    unsafe {
+        ffi::spice_main_channel_update_display(s.main_channel, 0, 0, 0, width, height, 1);
+    }
+    log::info!("requested guest resolution {width}x{height}");
 }
 
 /// Send Ctrl+Alt+Del to the VM.
@@ -127,31 +182,64 @@ pub fn send_ctrl_alt_del(state: &SharedState) {
 }
 
 /// Forward a key press from GTK to SPICE.
-pub fn key_press(state: &SharedState, hardware_keycode: u32) {
-    let s = state.borrow();
+///
+/// Returns `false` when the key has no XT scancode, so the caller can let it
+/// propagate to the host instead of swallowing it.
+pub fn key_press(state: &SharedState, hardware_keycode: u32) -> bool {
+    let mut s = state.borrow_mut();
     if s.inputs_channel.is_null() {
-        return;
+        return false;
     }
     let scancode = keymap::gtk_keycode_to_xt(hardware_keycode);
-    if scancode != 0 {
-        unsafe {
-            ffi::spice_inputs_channel_key_press(s.inputs_channel, scancode);
-        }
+    if scancode == 0 {
+        return false;
     }
+    s.held_keys.insert(scancode);
+    unsafe {
+        ffi::spice_inputs_channel_key_press(s.inputs_channel, scancode);
+    }
+    true
 }
 
 /// Forward a key release from GTK to SPICE.
-pub fn key_release(state: &SharedState, hardware_keycode: u32) {
-    let s = state.borrow();
+pub fn key_release(state: &SharedState, hardware_keycode: u32) -> bool {
+    let mut s = state.borrow_mut();
     if s.inputs_channel.is_null() {
-        return;
+        return false;
     }
     let scancode = keymap::gtk_keycode_to_xt(hardware_keycode);
-    if scancode != 0 {
+    if scancode == 0 {
+        return false;
+    }
+    s.held_keys.remove(&scancode);
+    unsafe {
+        ffi::spice_inputs_channel_key_release(s.inputs_channel, scancode);
+    }
+    true
+}
+
+/// Release every key the guest currently believes is held.
+///
+/// Call this whenever the window loses focus: the host compositor consumes the
+/// key-up for whatever chord took focus away (Alt+Tab, Super), so the guest
+/// would otherwise never see those keys come back up.
+pub fn release_all_keys(state: &SharedState) {
+    let mut s = state.borrow_mut();
+    if s.inputs_channel.is_null() {
+        s.held_keys.clear();
+        return;
+    }
+    let channel = s.inputs_channel;
+    let held: Vec<u32> = s.held_keys.drain().collect();
+    if held.is_empty() {
+        return;
+    }
+    for scancode in &held {
         unsafe {
-            ffi::spice_inputs_channel_key_release(s.inputs_channel, scancode);
+            ffi::spice_inputs_channel_key_release(channel, *scancode);
         }
     }
+    log::debug!("released {} held key(s) on focus loss", held.len());
 }
 
 /// Forward mouse position to SPICE (absolute coordinates in VM display space).
@@ -291,6 +379,18 @@ unsafe extern "C" fn on_channel_new(
                     >(on_display_invalidate),
                     user_data,
                 );
+                // Without this, the cached framebuffer pointer outlives the
+                // buffer spice-gtk frees on a guest resolution change, and the
+                // next render reads freed memory.
+                ffi::signal_connect(
+                    channel as ffi::gpointer,
+                    "display-primary-destroy",
+                    std::mem::transmute::<
+                        unsafe extern "C" fn(*mut ffi::SpiceDisplayChannel, ffi::gpointer),
+                        unsafe extern "C" fn(),
+                    >(on_display_primary_destroy),
+                    user_data,
+                );
 
                 // Explicitly connect the display channel
                 log::info!("Explicitly connecting display channel");
@@ -328,13 +428,26 @@ unsafe extern "C" fn on_display_primary_create(
 
         {
             let mut s = state.borrow_mut();
-            s.framebuffer = Some(Framebuffer { data: data as *const u8 });
+            s.framebuffer = Some(Framebuffer { data: data as *const u8, width, height, stride });
         }
 
         let s = state.borrow();
         if let Some(ref cb) = s.on_display_ready {
             cb(width, height);
         }
+    }
+}
+
+/// spice-gtk is about to free the primary surface. Drop our borrowed pointer
+/// before it dangles — the renderer already treats `None` as "nothing to draw".
+unsafe extern "C" fn on_display_primary_destroy(
+    _channel: *mut ffi::SpiceDisplayChannel,
+    user_data: ffi::gpointer,
+) {
+    unsafe {
+        let state = &*(user_data as *const RefCell<SpiceState>);
+        state.borrow_mut().framebuffer = None;
+        log::info!("SPICE display primary destroyed — framebuffer released");
     }
 }
 

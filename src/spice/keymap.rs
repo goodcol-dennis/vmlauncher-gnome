@@ -37,7 +37,23 @@ fn evdev_to_xt(evdev: u16) -> u32 {
         125 => 0xE05B, // Left Super
         126 => 0xE05C, // Right Super
         127 => 0xE05D, // Menu
-        _ if evdev < 128 => u32::from(evdev),
+
+        // Multimedia and power keys. These sit above the 1:1 range but below
+        // the old `< 128` cutoff, so they used to be forwarded verbatim — which
+        // lands on the Japanese-layout scancodes in AT set 1.
+        113 => 0xE020, // Mute
+        114 => 0xE02E, // Volume Down
+        115 => 0xE030, // Volume Up
+        116 => 0xE05E, // Power
+        163 => 0xE019, // Next Track
+        164 => 0xE022, // Play/Pause
+        165 => 0xE010, // Previous Track
+        166 => 0xE024, // Stop
+
+        // evdev 1..=88 share their numbering with AT set 1. Past that the two
+        // diverge (89..=95 are the Japanese-layout keys), so anything unlisted
+        // returns 0 and the caller leaves it to the host.
+        _ if evdev <= 88 => u32::from(evdev),
         _ => 0,
     }
 }
@@ -87,10 +103,41 @@ mod tests {
 
     #[test]
     fn rejects_codes_above_the_xt_range() {
-        // evdev 128 and up have no AT set-1 equivalent.
         assert_eq!(gtk_keycode_to_xt(gtk(128)), 0);
         assert_eq!(gtk_keycode_to_xt(gtk(240)), 0);
         assert_eq!(gtk_keycode_to_xt(u32::MAX), 0);
+    }
+
+    /// Media and power keys are above the 1:1 range and need explicit extended
+    /// scancodes. Forwarding them verbatim — as the old `< 128` cutoff did —
+    /// lands on the Japanese-layout keys instead.
+    #[test]
+    fn media_keys_use_extended_scancodes() {
+        assert_eq!(gtk_keycode_to_xt(gtk(113)), 0xE020, "Mute");
+        assert_eq!(gtk_keycode_to_xt(gtk(114)), 0xE02E, "Volume Down");
+        assert_eq!(gtk_keycode_to_xt(gtk(115)), 0xE030, "Volume Up");
+        assert_eq!(gtk_keycode_to_xt(gtk(116)), 0xE05E, "Power");
+        assert_eq!(gtk_keycode_to_xt(gtk(163)), 0xE019, "Next Track");
+        assert_eq!(gtk_keycode_to_xt(gtk(164)), 0xE022, "Play/Pause");
+        assert_eq!(gtk_keycode_to_xt(gtk(165)), 0xE010, "Previous Track");
+        assert_eq!(gtk_keycode_to_xt(gtk(166)), 0xE024, "Stop");
+    }
+
+    /// The 1:1 identity holds up to F12 (evdev 88) and no further.
+    #[test]
+    fn identity_range_stops_at_f12() {
+        assert_eq!(gtk_keycode_to_xt(gtk(87)), 0x57, "F11");
+        assert_eq!(gtk_keycode_to_xt(gtk(88)), 0x58, "F12");
+    }
+
+    /// evdev 89..=95 are Japanese-layout keys whose XT codes are not their
+    /// evdev numbers. Returning 0 leaves them to the host rather than sending
+    /// the guest a wrong keystroke.
+    #[test]
+    fn japanese_layout_range_is_not_forwarded() {
+        for evdev in 89..=95 {
+            assert_eq!(gtk_keycode_to_xt(gtk(evdev)), 0, "evdev {evdev}");
+        }
     }
 
     /// evdev 0 is "reserved" and maps to XT 0, which is also our sentinel for
@@ -105,8 +152,8 @@ mod tests {
     #[test]
     fn extended_scancodes_never_collide_with_plain_ones() {
         let extended = [
-            96, 97, 98, 99, 100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 119, 125, 126,
-            127,
+            96, 97, 98, 99, 100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 113, 114, 115,
+            116, 119, 125, 126, 127, 163, 164, 165, 166,
         ];
         for evdev in extended {
             let xt = gtk_keycode_to_xt(gtk(evdev));
