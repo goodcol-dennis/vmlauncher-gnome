@@ -1,5 +1,14 @@
 # vmlaunch
 
+> **HISTORICAL — superseded by [CLAUDE.md](CLAUDE.md) and the code.**
+> This is the original design document, kept for the reasoning behind the big
+> decisions. Several details were overtaken during implementation: VM control
+> uses `virsh` rather than libvirt-rs, `src/spice.rs` became a directory, the
+> desktop file is `tech.goodcol.vmlaunch.desktop` (the filename must match the
+> app ID or the dock icon breaks), the app does not launch fullscreen by
+> default, and the three "Open Decisions" at the bottom are all settled.
+> Do not treat anything below as a description of current behaviour.
+
 Single-click GTK4 app that starts a KVM/SPICE Windows 11 VM, embeds the SPICE display, and ties VM lifecycle to the app window. Replaces the current `win11-vm` shell script + `remote-viewer` combo with one dock icon.
 
 ## Goals
